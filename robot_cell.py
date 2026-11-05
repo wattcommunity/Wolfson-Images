@@ -17,6 +17,11 @@ picture updates on its own:
 
     cell.finish()              # keep the window open until you close it
 
+In a Jupyter notebook the picture appears in the cell's output instead of
+in a window, and updates in place as the state changes; finish() is not
+needed there.  Each notebook cell that changes the state gets its own
+picture, and typing `cell` on its own line shows the current state.
+
 Each arm (cell.arms[0], cell.arms[1], cell.arms[2]) has four values:
 
     angle         0 = facing you (towards its rack)
@@ -49,6 +54,17 @@ FONT_PATHS = ("/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf", "DejaVuSans
 HUD = (56, 200, 240)
 TEXT = (130, 140, 165)
 WARN = (255, 90, 90)
+
+
+def _in_notebook() -> bool:
+    """True when running inside a Jupyter (or Colab / VS Code) notebook kernel."""
+    try:
+        from IPython import get_ipython
+    except ImportError:
+        return False
+    shell = get_ipython()
+    return shell is not None and ("IPKernelApp" in shell.config
+                                  or type(shell).__name__ == "ZMQInteractiveShell")
 
 
 class RobotError(Exception):
@@ -117,13 +133,19 @@ class RobotCell:
     """The whole cell: three arms, a conveyor, and the window that shows them.
 
     delay      seconds to pause after each change, so you can watch each step
-    window     False to run without a window (for example to only save a GIF)
+    display    where to show the picture:
+                 "auto"     in the notebook when run in Jupyter, else a window
+                 "notebook" in the Jupyter cell output
+                 "window"   in a tkinter window
+                 "none"     nowhere (for example to only save a GIF)
+    window     older switch: window=False is the same as display="none"
     record     True to keep every picture, for save_gif()
     arm_class  your own subclass of RobotArm, if you have one
     """
 
-    def __init__(self, delay: float = 0.5, window: bool = True, record: bool = False,
-                 arm_class: type = RobotArm, verbose: bool = True) -> None:
+    def __init__(self, delay: float = 0.5, display: str = "auto", record: bool = False,
+                 arm_class: type = RobotArm, verbose: bool = True,
+                 window: bool = True) -> None:
         self.delay = delay
         self.verbose = verbose
         self._frames: list[Image.Image] = [] if record else None
@@ -134,14 +156,26 @@ class RobotCell:
         self._font_title = self._load_font(14)
         self._tk = None
         self._closed = False
-        if window:
+        self._notebook = None          # IPython shell when showing in a notebook
+        self._handle = None            # the notebook output being updated
+        self._handle_cell = None       # which notebook cell that output belongs to
+        if not window:
+            display = "none"
+        if display not in ("auto", "notebook", "window", "none"):
+            raise RobotError('display must be "auto", "notebook", "window" or "none", '
+                             f"not {display!r}")
+        if display == "auto":
+            display = "notebook" if _in_notebook() else "window"
+        if display == "notebook":
+            self._open_notebook()
+        elif display == "window":
             self._open_window()
         self.arms = tuple(arm_class(self, i) for i in range(3))
         self._refresh("start", [])
 
     # ---- public ----
     def finish(self) -> None:
-        """Keep the window open until it is closed."""
+        """Keep the window open until it is closed (does nothing in a notebook)."""
         if self._tk is not None and not self._closed:
             self._tk.mainloop()
 
@@ -152,6 +186,13 @@ class RobotCell:
         ms = frame_ms or max(60, int(self.delay * 1000))
         self._frames[0].save(path, save_all=True, append_images=self._frames[1:],
                              duration=ms, loop=0)
+
+    def _repr_png_(self) -> bytes:
+        """Lets Jupyter show the cell when `cell` is the last line of a code cell."""
+        import io
+        buf = io.BytesIO()
+        self.snapshot().save(buf, format="PNG")
+        return buf.getvalue()
 
     def snapshot(self) -> Image.Image:
         """The picture for the current state, as a Pillow image."""
@@ -214,6 +255,31 @@ class RobotCell:
             while time.monotonic() < end and not self._closed:
                 self._tk.update()
                 time.sleep(0.01)
+        elif self._notebook is not None:
+            self._show_in_notebook(img)
+            time.sleep(self.delay)
+
+    # ---- notebook ----
+    def _open_notebook(self) -> None:
+        try:
+            from IPython import get_ipython
+            from IPython.display import display
+        except ImportError:
+            print("robot_cell: not running in Jupyter; opening a window instead")
+            self._open_window()
+            return
+        self._notebook = get_ipython()
+        self._display = display
+
+    def _show_in_notebook(self, img: Image.Image) -> None:
+        # One picture per notebook cell: the first change in a cell adds a new
+        # picture to that cell's output, later changes update it in place.
+        cell = getattr(self._notebook, "execution_count", None)
+        if self._handle is None or cell != self._handle_cell:
+            self._handle = self._display(img, display_id=True)
+            self._handle_cell = cell
+        else:
+            self._handle.update(img)
 
     # ---- window ----
     def _open_window(self) -> None:
