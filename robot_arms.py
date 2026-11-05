@@ -14,6 +14,9 @@ gripper.  The important point of the model is the *base yaw*:
   by the yaw angle ``theta``.  A point (r, z) in the arm plane therefore sits
   at world position (r*cos(theta), r*sin(theta), z).
 * Only *after* that rotation are points projected onto the screen.
+* The hinge pins (shoulder, elbow, wrist) lie along the axis
+  (-sin(theta), cos(theta), 0), at right angles to the arm plane, and the
+  links are solid bars with their width along that axis, so they turn too.
 
 So when the pillar turns, the shoulder axis, the links, the elbow, the
 gripper and any tube it holds all turn with it.  (The old animation solved
@@ -31,7 +34,7 @@ Run:  python robot_arms.py       (needs Pillow)
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 from PIL import Image, ImageDraw, ImageFont
 
@@ -61,6 +64,7 @@ STEEL_DARK = (78, 86, 108)
 ARM_WHITE = (232, 236, 244)
 ARM_SHADE = (176, 184, 202)
 ARM_EDGE = (60, 66, 86)
+LINK_TOP = (206, 212, 226)  # the top/bottom faces of a link, lit less than its side
 ORANGE = (255, 145, 30)
 ORANGE_DARK = (150, 70, 10)
 GLASS = (200, 210, 228)
@@ -160,38 +164,62 @@ def draw_tube(d: ImageDraw.ImageDraw, bottom: tuple[float, float], colour) -> No
            fill=(255, 255, 255), width=SS)
 
 
-@dataclass
-class Rack:
-    """A 5-slot tube rack on the bench in front-left of an arm."""
+def draw_tube_clipped(img: Image.Image, bottom: tuple[float, float], colour,
+                      clip_y: float) -> None:
+    """Draw a tube but only the part above screen row `clip_y` (used for a tube
+    rising up into a rack slot from the feeder underneath)."""
+    bx, by = bottom
+    pad = 4 * SS
+    w, h = int(TUBE_W * SS + 2 * pad), int(TUBE_LEN * SS + 2 * pad)
+    layer = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+    draw_tube(ImageDraw.Draw(layer), (w / 2, h - pad), colour)
+    left, top = int(bx - w / 2), int(by - (h - pad))
+    keep = int(clip_y) - top
+    if keep <= 0:
+        return
+    layer = layer.crop((0, 0, w, min(keep, h)))
+    img.paste(layer, (left, top), layer)
 
-    colour: tuple
-    slots: list = field(default_factory=lambda: [True] * 5)
-    depth: float = -130.0
-    first_x: float = -95.0
-    pitch: float = 20.0
-    tube_z: float = 10.0          # z of a seated tube's bottom
+
+class Rack:
+    """A 5-slot tube rack on the bench in front-left of an arm.  A feeder under
+    the bench pushes a fresh tube up into a slot after the arm empties it."""
+
+    DEPTH = -130.0
+    FIRST_X = -95.0
+    PITCH = 20.0
+    TUBE_Z = 10.0         # z of a seated tube's bottom
+    TOP_Z = 14.0          # top surface of the rack block
+
+    def __init__(self, colour) -> None:
+        self.colour = colour
+        self.fill = [1.0] * 5      # per slot: 0 = empty, 1 = seated, between = rising
 
     def slot_xy(self, k: int) -> tuple[float, float]:
-        return self.first_x + k * self.pitch, self.depth
+        return self.FIRST_X + k * self.PITCH, self.DEPTH
 
-    def draw(self, d: ImageDraw.ImageDraw, P: Projector) -> None:
+    def draw(self, img: Image.Image, d: ImageDraw.ImageDraw, P: Projector) -> None:
         x0, y = self.slot_xy(0)
-        x1, _ = self.slot_xy(len(self.slots) - 1)
-        a = P(x0 - 16, y, 14)
+        x1, _ = self.slot_xy(len(self.fill) - 1)
+        a = P(x0 - 16, y, self.TOP_Z)
         b = P(x1 + 16, y, 0)
         d.rectangle([a[0], a[1], b[0], b[1]], fill=(70, 78, 108),
                     outline=(110, 120, 150), width=SS)
-        for k, full in enumerate(self.slots):
-            sx, sy = P(*self.slot_xy(k), self.tube_z)
-            if full:
+        for k, f in enumerate(self.fill):
+            sx, sy = P(*self.slot_xy(k), self.TUBE_Z)
+            if f >= 1.0:
                 draw_tube(d, (sx, sy), self.colour)
-            else:
-                d.ellipse([sx - 6 * SS, sy - 3 * SS, sx + 6 * SS, sy + 3 * SS],
-                          fill=(20, 24, 40))
+                continue
+            d.ellipse([sx - 6 * SS, sy - 3 * SS, sx + 6 * SS, sy + 3 * SS], fill=(20, 24, 40))
+            if f > 0.0:
+                rise = (1.0 - smooth(f)) * TUBE_LEN
+                draw_tube_clipped(img, P(*self.slot_xy(k), self.TUBE_Z - rise),
+                                  self.colour, P(*self.slot_xy(k), self.TOP_Z)[1])
+
     def draw_controller(self, d: ImageDraw.ImageDraw, P: Projector) -> None:
         """Controller box in front-right of the arm (drawn after the arm,
         because it is nearer the viewer than the pillar)."""
-        y = self.depth
+        y = self.DEPTH
         c0 = P(62, y, 60)
         c1 = P(88, y, 0)
         d.rounded_rectangle([c0[0], c0[1], c1[0], c1[1]], radius=3 * SS,
@@ -201,38 +229,46 @@ class Rack:
 
 
 class Conveyor:
-    """An indexing belt carrying 3-slot tube carriers to the right."""
+    """A continuously running belt carrying 3-slot carriers to the right.
+
+    Carriers enter empty on the left; arm j drops a tube into slot j of each
+    carrier as it passes, so carriers leave on the right holding one tube of
+    each colour.  Positions are in absolute scene coordinates (x = 0 at the
+    left edge of the picture), drawn with a projector whose origin is x = 0.
+    """
 
     DEPTH = 90.0
     BELT_Z = 81.0
     CARRIER_H = 8.0
-    PITCH = 120.0               # carrier spacing (two per arm spacing)
+    PITCH = 160.0               # carrier spacing
     SLOT_DX = 20.0
+    X0 = 0.0                    # set by Cell so the carriers line up with the arms
 
     def __init__(self) -> None:
+        self.P = Projector(0)
         self.offset = 0.0
-        self.empty: dict[int, int] = {}   # carrier index -> empty slot
+        self.filled = lambda k, j: False      # replaced by Cell
 
     @property
     def tube_z(self) -> float:
         return self.BELT_Z + self.CARRIER_H - 4
 
-    def carrier_x(self, k: int) -> float:
-        """World/screen-x (before shear) of carrier k's centre."""
-        return 40.0 + k * self.PITCH + self.offset
+    def carrier_x(self, k: int, offset: float | None = None) -> float:
+        """Scene x (before depth shear) of carrier k's centre."""
+        return self.X0 + k * self.PITCH + (self.offset if offset is None else offset)
 
-    def carrier_at(self, x: float) -> int:
-        return round((x - 40.0 - self.offset) / self.PITCH)
+    def slot_x(self, k: int, j: int, offset: float | None = None) -> float:
+        return self.carrier_x(k, offset) + (j - 1) * self.SLOT_DX
 
-    def draw(self, d: ImageDraw.ImageDraw, P: Projector) -> None:
-        y = self.DEPTH
+    def draw(self, d: ImageDraw.ImageDraw) -> None:
+        P, y = self.P, self.DEPTH
         # legs
-        for lx in range(60, W, 120):
+        for lx in range(60, W + 60, 120):
             a = P(lx - 3, y, self.BELT_Z - 14)
             b = P(lx + 3, y, -20)
             d.rectangle([a[0], a[1], b[0], b[1]], fill=(34, 40, 62))
-        top = P(-200, y, self.BELT_Z)[1]
-        bot = P(-200, y, self.BELT_Z - 30)[1]
+        top = P(0, y, self.BELT_Z)[1]
+        bot = P(0, y, self.BELT_Z - 30)[1]
         d.rectangle([0, top - 4 * SS, W * SS, top + 2 * SS], fill=STEEL)
         d.rectangle([0, top + 2 * SS, W * SS, bot], fill=(26, 32, 52))
         d.rectangle([0, bot, W * SS, bot + 6 * SS], fill=STEEL)
@@ -244,23 +280,22 @@ class Conveyor:
             px = cx * SS
             d.line([px - 4 * SS, mid - hh, px + 4 * SS, mid, px - 4 * SS, mid + hh],
                    fill=(40, 140, 200), width=3 * SS)
-        # carriers (drawn left to right)
-        k0 = self.carrier_at(-200)
-        k1 = self.carrier_at(W + 200)
-        for k in range(k0 - 1, k1 + 2):
+        # carriers
+        k0 = math.floor((-120 - self.X0 - self.offset) / self.PITCH)
+        k1 = math.ceil((W + 120 - self.X0 - self.offset) / self.PITCH)
+        for k in range(k0, k1 + 1):
             cx = self.carrier_x(k)
             a = P(cx - 38, y, self.BELT_Z + self.CARRIER_H + 12)
             b = P(cx + 38, y, self.BELT_Z)
             d.rounded_rectangle([a[0], a[1], b[0], b[1]], radius=3 * SS,
                                 fill=(70, 78, 106), outline=(116, 126, 156), width=SS)
             for j in range(3):
-                if self.empty.get(k) == j:
-                    sx, sy = P(cx + (j - 1) * self.SLOT_DX, y, self.BELT_Z + 18)
+                if self.filled(k, j):
+                    draw_tube(d, P(self.slot_x(k, j), y, self.tube_z), TUBE_COLOURS[j])
+                else:
+                    sx, sy = P(self.slot_x(k, j), y, self.BELT_Z + 18)
                     d.ellipse([sx - 6 * SS, sy - 3 * SS, sx + 6 * SS, sy + 3 * SS],
                               fill=(20, 24, 40))
-                    continue
-                draw_tube(d, P(cx + (j - 1) * self.SLOT_DX, y, self.tube_z),
-                          TUBE_COLOURS[j])
 
 
 # --------------------------------------------------------------------------
@@ -333,18 +368,6 @@ class RobotArm:
         return [self.P(radius * math.cos(a), radius * math.sin(a), z)
                 for a in (i * 2 * math.pi / 48 for i in range(48))]
 
-    def _thick(self, d, a, b, width, fill, edge) -> None:
-        (ax, ay), (bx, by) = a, b
-        L = math.hypot(bx - ax, by - ay) or 1.0
-        nx, ny = -(by - ay) / L * width / 2, (bx - ax) / L * width / 2
-        poly = [(ax + nx, ay + ny), (bx + nx, by + ny), (bx - nx, by - ny), (ax - nx, ay - ny)]
-        d.polygon(poly, fill=fill, outline=edge, width=SS)
-        for (cx, cy) in (a, b):
-            d.ellipse([cx - width / 2, cy - width / 2, cx + width / 2, cy + width / 2],
-                      fill=fill, outline=edge, width=SS)
-        d.line([(ax + nx * 0.55, ay + ny * 0.55), (bx + nx * 0.55, by + ny * 0.55)],
-               fill=(255, 255, 255), width=SS)
-
     def _pillar(self, d) -> None:
         P, th = self.P, self.pose.theta
         d.polygon(self._ring(0, 40), fill=(205, 210, 222), outline=ARM_EDGE, width=SS)
@@ -411,6 +434,18 @@ class RobotArm:
         d.polygon(near, fill=ORANGE, outline=ORANGE_DARK, width=SS)
         d.polygon(self._disc(c, radius * 0.4, -sign * half_width), fill=(60, 34, 10))
 
+    def _link(self, d, p0, p1, half_width, thick) -> None:
+        """A 3D arm link from joint p0 to joint p1: a bar with rounded ends,
+        `thick` deep in the arm plane and 2*half_width wide along the hinge
+        axis, so it turns with the yaw just like the hinge pins."""
+        sign = self._far_side()
+        near = self._disc(p0, thick / 2, -sign * half_width, 24) + \
+            self._disc(p1, thick / 2, -sign * half_width, 24)
+        far = self._disc(p0, thick / 2, sign * half_width, 24) + \
+            self._disc(p1, thick / 2, sign * half_width, 24)
+        d.polygon(convex_hull(near + far), fill=LINK_TOP, outline=ARM_EDGE, width=SS)
+        d.polygon(convex_hull(near), fill=ARM_WHITE, outline=ARM_EDGE, width=SS)
+
     def _yoke_cheek(self, d, side: int) -> None:
         """One shoulder bracket plate, standing on the turret in the arm plane."""
         u, a = self._axes()
@@ -443,23 +478,43 @@ class RobotArm:
 
     def draw(self, d: ImageDraw.ImageDraw) -> None:
         j = self.forward()
-        S, E, Wr = (self.P(*j[k]) for k in ("shoulder", "elbow", "wrist"))
         far_side = self._far_side()
         self._pillar(d)
         self._yoke_cheek(d, far_side)            # cheek plate behind the arm
-        self._thick(d, S, E, 17 * SS, ARM_WHITE, ARM_EDGE)
-        self._thick(d, E, Wr, 13 * SS, ARM_WHITE, ARM_EDGE)
+        self._link(d, j["shoulder"], j["elbow"], 10, 17)    # upper arm
+        self._link(d, j["elbow"], j["wrist"], 8, 13)        # forearm
         self._gripper(d, j)
         self._yoke_cheek(d, -far_side)           # cheek plate in front of the arm
         self._hinge(d, j["shoulder"], 9, self.YOKE_HW + 3)
-        self._hinge(d, j["elbow"], 8, 10)
-        self._hinge(d, j["wrist"], 5, 7)
+        self._hinge(d, j["elbow"], 8, 12)
+        self._hinge(d, j["wrist"], 5, 9)
 
 
 # --------------------------------------------------------------------------
-# Motion planning (a simple timeline of keyframed moves + events)
+# Motion planning
 # --------------------------------------------------------------------------
+# Every arm runs the same cycle of CYCLE frames, offset in time so that it
+# meets a passing carrier.  The cycle (tau = frame within the cycle):
+#
+#   0-6    descend onto the next tube in the rack
+#   6-9    close the gripper (tube lifted out of the rack at 9)
+#   9-15   lift clear of the rack
+#   15-29  swing round (base yaw) to above the moving carrier
+#   29-35  descend into the carrier's empty slot, tracking the belt
+#   35-38  open the gripper (tube left in the carrier at 38)
+#   38-43  lift clear, still tracking the belt
+#   43-58  swing back to above the next rack slot
+#
+# The rack slot that was emptied is refilled from underneath a little later.
+# Everything is a pure function of the frame number, and after
+# LOOP_CYCLES cycles the scene is exactly where it started, so the GIF loops.
 LIFT = 46            # clearance above the tube tops when travelling
+CYCLE = 58           # frames per pick-and-place cycle
+PICK = 9             # tau at which the tube leaves the rack
+RELEASE = 38         # tau at which the tube is left in the carrier
+REFILL_DELAY = 18    # frames after a pick before the feeder starts to raise a tube
+REFILL_TIME = 16     # frames for a new tube to rise into the slot
+LOOP_CYCLES = 5      # one cycle per rack slot
 
 
 class Cell:
@@ -469,39 +524,122 @@ class Cell:
         self.conveyor = Conveyor()
         self.arms = [RobotArm(i, x) for i, x in enumerate(self.ARM_X)]
         self.racks = [Rack(TUBE_COLOURS[i]) for i in range(3)]
-        for r in self.racks:
-            r.slots[0] = False                       # one free slot to start with
+        self.belt_speed = Conveyor.PITCH / CYCLE          # px per frame
         self.frame = 0
         self.font_lbl = load_font(13)
         self.font_title = load_font(14, bold=True)
         self.font_small = load_font(11)
 
-    # ---- targets in each arm's own world frame ----
-    def conveyor_pose(self, arm: RobotArm, z_extra: float) -> Pose:
-        k = self.conveyor.carrier_at(arm.base_x)
-        x = self.conveyor.carrier_x(k) + (arm.index - 1) * Conveyor.SLOT_DX - arm.base_x
-        return Pose.at(x, Conveyor.DEPTH, self.conveyor.tube_z + TUBE_LEN - 6 + z_extra)
+        # Line the carriers up so arm 0 releases into slot 0 of carrier 0 at
+        # frame RELEASE, then give each other arm the time offset (phase) at
+        # which its own slot passes directly behind it.
+        v = self.belt_speed
+        self.conveyor.X0 = self.ARM_X[0] + Conveyor.SLOT_DX - v * RELEASE
+        self.phase = []
+        for j, x in enumerate(self.ARM_X):
+            lag = (x - (j - 1) * Conveyor.SLOT_DX - self.conveyor.X0 - v * RELEASE) % Conveyor.PITCH
+            self.phase.append(round(-lag / v) % CYCLE)
+        self.conveyor.filled = self.carrier_filled
 
-    def rack_pose(self, arm: RobotArm, slot: int, z_extra: float) -> Pose:
-        rack = self.racks[arm.index]
-        x, y = rack.slot_xy(slot)
-        return Pose.at(x, y, rack.tube_z + TUBE_LEN - 6 + z_extra)
+    # ---- timing helpers ----
+    def release_frame(self, j: int, n: int) -> int:
+        return n * CYCLE + RELEASE - self.phase[j]
+
+    def target_carrier(self, j: int, n: int) -> int:
+        """The carrier arm j drops its tube into during cycle n."""
+        offset = self.belt_speed * self.release_frame(j, n)
+        x = self.ARM_X[j] - (j - 1) * Conveyor.SLOT_DX - self.conveyor.X0 - offset
+        return round(x / Conveyor.PITCH)
+
+    def carrier_filled(self, k: int, j: int) -> bool:
+        """Has arm j already put its tube into carrier k?"""
+        v = self.belt_speed
+        # frame at which carrier k's slot j is directly behind arm j
+        f_exact = (self.ARM_X[j] - (j - 1) * Conveyor.SLOT_DX - self.conveyor.X0
+                   - k * Conveyor.PITCH) / v
+        n = round((f_exact - RELEASE + self.phase[j]) / CYCLE)
+        return self.frame >= self.release_frame(j, n)
+
+    def rack_fill(self, j: int, slot: int) -> float:
+        """0 = empty, 1 = seated, in between = being raised by the feeder."""
+        c = self.frame - PICK + self.phase[j]
+        n = c // CYCLE                                   # latest cycle that has picked
+        n -= (n - slot) % LOOP_CYCLES                    # latest one that used this slot
+        since = self.frame - (n * CYCLE + PICK - self.phase[j])
+        return max(0.0, min(1.0, (since - REFILL_DELAY) / REFILL_TIME))
+
+    # ---- poses (in each arm's own frame) ----
+    def rack_pose(self, j: int, slot: int, z_extra: float) -> Pose:
+        x, y = self.racks[j].slot_xy(slot % LOOP_CYCLES)
+        return Pose.at(x, y, Rack.TUBE_Z + TUBE_LEN - 6 + z_extra)
+
+    def conveyor_pose(self, j: int, k: int, frame: float, z_extra: float) -> Pose:
+        x = self.conveyor.slot_x(k, j, self.belt_speed * frame) - self.ARM_X[j]
+        return Pose.at(x, Conveyor.DEPTH,
+                       self.conveyor.tube_z + TUBE_LEN - 6 + z_extra)
+
+    def update_arm(self, j: int) -> None:
+        arm, f = self.arms[j], self.frame
+        n, tau = divmod(f + self.phase[j], CYCLE)
+        slot = n % LOOP_CYCLES
+        k = self.target_carrier(j, n)
+        R_up, R_dn = self.rack_pose(j, slot, LIFT), self.rack_pose(j, slot, 0)
+        C_up, C_dn = self.conveyor_pose(j, k, f, LIFT), self.conveyor_pose(j, k, f, 0)
+
+        def seg(t0, t1):
+            return smooth((tau - t0) / (t1 - t0))
+
+        if tau < 6:
+            pose = R_up.blend(R_dn, seg(0, 6))
+        elif tau < 9:
+            pose = R_dn
+        elif tau < 15:
+            pose = R_dn.blend(R_up, seg(9, 15))
+        elif tau < 29:
+            pose = R_up.blend(C_up, seg(15, 29))
+        elif tau < 35:
+            pose = C_up.blend(C_dn, seg(29, 35))
+        elif tau < 38:
+            pose = C_dn
+        elif tau < 43:
+            pose = C_dn.blend(C_up, seg(38, 43))
+        else:
+            lifted = self.conveyor_pose(j, k, f - (tau - 43), LIFT)
+            pose = lifted.blend(self.rack_pose(j, slot + 1, LIFT), seg(43, CYCLE))
+        arm.pose = pose
+
+        if tau < 6:
+            arm.grip_open = 1.0
+        elif tau < 9:
+            arm.grip_open = 1.0 - seg(6, 9)
+        elif tau < 35:
+            arm.grip_open = 0.0
+        elif tau < 38:
+            arm.grip_open = seg(35, 38)
+        else:
+            arm.grip_open = 1.0
+        arm.holding = TUBE_COLOURS[j] if PICK <= tau < RELEASE else None
 
     # ---- frame generation ----
-    def render(self) -> Image.Image:
+    def render(self, frame: int) -> Image.Image:
+        self.frame = frame
+        self.conveyor.offset = self.belt_speed * frame
+        for j, rack in enumerate(self.racks):
+            rack.fill = [self.rack_fill(j, s) for s in range(len(rack.fill))]
+            self.update_arm(j)
+
         img = Image.new("RGB", (W * SS, H * SS), BG)
         d = ImageDraw.Draw(img)
         self._background(d)
-        self.conveyor.draw(d, self.arms[0].P)
+        self.conveyor.draw(d)
         self._bench(d)
         for arm, rack in zip(self.arms, self.racks):
-            rack.draw(d, arm.P)
+            rack.draw(img, d, arm.P)
         for arm in self.arms:
             arm.draw(d)
         for arm, rack in zip(self.arms, self.racks):
             rack.draw_controller(d, arm.P)
         self._footer(d)
-        self.frame += 1
         return img.resize((W, H), Image.LANCZOS)
 
     def _background(self, d) -> None:
@@ -509,14 +647,15 @@ class Cell:
             d.line([x * SS, 0, x * SS, 250 * SS], fill=GRID, width=SS)
         for y in range(0, 250, 40):
             d.line([0, y * SS, W * SS, y * SS], fill=GRID, width=SS)
-        for px in (22, 648):
+        loop_phase = 2 * math.pi * self.frame / (CYCLE * LOOP_CYCLES)
+        for px, speed in ((22, 3), (648, 4)):
             d.rounded_rectangle([px * SS, 14 * SS, (px + 130) * SS, 78 * SS], radius=4 * SS,
                                 outline=HUD, width=SS, fill=(14, 26, 44))
             for i, w in enumerate((60, 44, 50)):
                 y = (22 + i * 6) * SS
                 d.line([(px + 8) * SS, y, (px + 8 + w) * SS, y], fill=(80, 140, 190), width=2 * SS)
             pts = [((px + 8 + i) * SS,
-                    (56 + 8 * math.sin(i / 14 + self.frame * 0.15 + px)) * SS)
+                    (56 + 8 * math.sin(i / 14 + speed * loop_phase + px)) * SS)
                    for i in range(0, 115, 2)]
             d.line(pts, fill=HUD, width=SS)
 
@@ -541,74 +680,7 @@ class Cell:
 
 def build_frames() -> list[Image.Image]:
     cell = Cell()
-    frames: list[Image.Image] = []
-
-    def move(steps: int, targets, grip=None, belt: float = 0.0):
-        """Move every arm from its current pose to targets[i] over `steps` frames."""
-        starts = [a.pose for a in cell.arms]
-        g0 = [a.grip_open for a in cell.arms]
-        off0 = cell.conveyor.offset
-        for s in range(1, steps + 1):
-            t = smooth(s / steps)
-            for i, a in enumerate(cell.arms):
-                if targets is not None:
-                    a.pose = starts[i].blend(targets[i], t)
-                if grip is not None:
-                    a.grip_open = lerp(g0[i], grip, t)
-            cell.conveyor.offset = off0 + belt * t
-            frames.append(cell.render())
-
-    def each(fn):
-        return [fn(a) for a in cell.arms]
-
-    def set_conveyor_slot(empty: bool):
-        for a in cell.arms:
-            k = cell.conveyor.carrier_at(a.base_x)
-            if empty:
-                cell.conveyor.empty[k] = a.index
-            else:
-                cell.conveyor.empty.pop(k, None)
-
-    # start hovering over the conveyor
-    for a in cell.arms:
-        a.pose = cell.conveyor_pose(a, LIFT)
-
-    # Two cycles: the free rack slot alternates 0 -> 4 -> 0, so the GIF loops.
-    for gap, take in ((0, 4), (4, 0)):
-        # --- pick the incoming tube off the carrier
-        move(7, each(lambda a: cell.conveyor_pose(a, 0)))
-        move(3, None, grip=0.0)
-        set_conveyor_slot(True)
-        for a in cell.arms:
-            a.holding = TUBE_COLOURS[a.index]
-        move(6, each(lambda a: cell.conveyor_pose(a, LIFT)))
-        # --- swing round (base yaw) to the rack and place it in the free slot
-        move(14, each(lambda a: cell.rack_pose(a, gap, LIFT)))
-        move(6, each(lambda a: cell.rack_pose(a, gap, 0)))
-        move(3, None, grip=1.0)
-        for a, r in zip(cell.arms, cell.racks):
-            a.holding = None
-            r.slots[gap] = True
-        move(5, each(lambda a: cell.rack_pose(a, gap, LIFT * 0.6)))
-        # --- pick a processed tube from the other end of the rack
-        move(8, each(lambda a: cell.rack_pose(a, take, LIFT * 0.6)))
-        move(5, each(lambda a: cell.rack_pose(a, take, 0)))
-        move(3, None, grip=0.0)
-        for a, r in zip(cell.arms, cell.racks):
-            a.holding = TUBE_COLOURS[a.index]
-            r.slots[take] = False
-        move(6, each(lambda a: cell.rack_pose(a, take, LIFT)))
-        # --- swing back to the conveyor and drop it in the carrier
-        move(14, each(lambda a: cell.conveyor_pose(a, LIFT)))
-        move(7, each(lambda a: cell.conveyor_pose(a, 0)))
-        move(3, None, grip=1.0)
-        for a in cell.arms:
-            a.holding = None
-        set_conveyor_slot(False)
-        move(6, each(lambda a: cell.conveyor_pose(a, LIFT)))
-        # --- index the belt one carrier pitch while the arms hover clear
-        move(12, None, belt=Conveyor.PITCH)
-    return frames
+    return [cell.render(f) for f in range(CYCLE * LOOP_CYCLES)]
 
 
 def main() -> None:
