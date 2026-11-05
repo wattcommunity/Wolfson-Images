@@ -47,6 +47,8 @@ OUTFILE = "robot_arms.gif"
 DEPTH_RISE = 0.45        # screen pixels up per unit of depth
 DEPTH_SHEAR = 0.30       # screen pixels right per unit of depth
 BASE_SCREEN_Y = 270      # screen y of every pillar base (z = 0, y = 0)
+# Direction the camera looks along (into the scene) for this projection.
+VIEW_DIR = (-DEPTH_SHEAR, 1.0, -DEPTH_RISE)
 
 # Colours
 BG = (12, 16, 30)
@@ -96,6 +98,27 @@ def lerp_angle(a: float, b: float, t: float) -> float:
     """Interpolate angles along the shortest path."""
     d = (b - a + math.pi) % (2 * math.pi) - math.pi
     return a + d * t
+
+
+def convex_hull(points):
+    """Monotone-chain convex hull of 2D screen points."""
+    pts = sorted(set(points))
+    if len(pts) < 3:
+        return pts
+
+    def cross(o, a, b):
+        return (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0])
+
+    lower, upper = [], []
+    for p in pts:
+        while len(lower) >= 2 and cross(lower[-2], lower[-1], p) <= 0:
+            lower.pop()
+        lower.append(p)
+    for p in reversed(pts):
+        while len(upper) >= 2 and cross(upper[-2], upper[-1], p) <= 0:
+            upper.pop()
+        upper.append(p)
+    return lower[:-1] + upper[:-1]
 
 
 # --------------------------------------------------------------------------
@@ -322,12 +345,6 @@ class RobotArm:
         d.line([(ax + nx * 0.55, ay + ny * 0.55), (bx + nx * 0.55, by + ny * 0.55)],
                fill=(255, 255, 255), width=SS)
 
-    def _joint(self, d, p, r) -> None:
-        x, y = p
-        r *= SS
-        d.ellipse([x - r, y - r, x + r, y + r], fill=ORANGE, outline=ORANGE_DARK, width=SS)
-        d.ellipse([x - r * 0.4, y - r * 0.4, x + r * 0.4, y + r * 0.4], fill=(60, 34, 10))
-
     def _pillar(self, d) -> None:
         P, th = self.P, self.pose.theta
         d.polygon(self._ring(0, 40), fill=(205, 210, 222), outline=ARM_EDGE, width=SS)
@@ -352,19 +369,57 @@ class RobotArm:
         d.ellipse([mx - 2.5 * SS, my - 2.5 * SS, mx + 2.5 * SS, my + 2.5 * SS],
                   fill=HUD)
 
-    def _shoulder_yoke(self, d, joints) -> None:
-        """The shoulder bracket: its pin axis is perpendicular to the arm plane,
-        so it is drawn with the yaw applied - it visibly turns with the base."""
+    # ----- hinges -----------------------------------------------------------
+    # Every hinge pin (shoulder, elbow, wrist) is horizontal and perpendicular
+    # to the arm plane, i.e. along (-sin(theta), cos(theta), 0).  The hinges are
+    # drawn as real 3D cylinders / plates about that axis, so they turn with
+    # the base yaw instead of always facing the camera.
+    YOKE_HW = 14         # half-gap between the shoulder yoke cheek plates
+
+    def _axes(self):
         th = self.pose.theta
-        ax = (-math.sin(th), math.cos(th))          # shoulder pin axis (horizontal)
-        for side in (-1, 1):
-            ox, oy = ax[0] * 12 * side, ax[1] * 12 * side
-            a = self.P(ox, oy, self.PILLAR_H)
-            b = self.P(ox, oy, self.SHOULDER_Z)
-            d.line([a, b], fill=ARM_SHADE, width=7 * SS)
-        p0 = self.P(-ax[0] * 13, -ax[1] * 13, self.SHOULDER_Z)
-        p1 = self.P(ax[0] * 13, ax[1] * 13, self.SHOULDER_Z)
-        d.line([p0, p1], fill=ORANGE_DARK, width=6 * SS)
+        u = (math.cos(th), math.sin(th), 0.0)      # radial direction in the arm plane
+        a = (-math.sin(th), math.cos(th), 0.0)     # hinge pin axis
+        return u, a
+
+    def _far_side(self) -> int:
+        """+1 if the +axis end of a hinge points away from the viewer, else -1.
+        VIEW_DIR is the world direction that projects to a single screen point."""
+        _, a = self._axes()
+        dot = a[0] * VIEW_DIR[0] + a[1] * VIEW_DIR[1]
+        return 1 if dot >= 0 else -1
+
+    def _disc(self, c, radius, offset=0.0, n=32):
+        """Screen points of a circle lying in the arm plane, centred at world
+        point c, shifted `offset` along the hinge axis."""
+        u, a = self._axes()
+        pts = []
+        for i in range(n):
+            ph = 2 * math.pi * i / n
+            cr, cz = radius * math.cos(ph), radius * math.sin(ph)
+            pts.append(self.P(c[0] + u[0] * cr + a[0] * offset,
+                              c[1] + u[1] * cr + a[1] * offset,
+                              c[2] + cz))
+        return pts
+
+    def _hinge(self, d, c, radius, half_width) -> None:
+        """An orange hinge pin: a cylinder of `radius` along the hinge axis."""
+        sign = self._far_side()
+        far = self._disc(c, radius, sign * half_width)
+        near = self._disc(c, radius, -sign * half_width)
+        d.polygon(convex_hull(far + near), fill=(214, 112, 20), outline=ORANGE_DARK, width=SS)
+        d.polygon(near, fill=ORANGE, outline=ORANGE_DARK, width=SS)
+        d.polygon(self._disc(c, radius * 0.4, -sign * half_width), fill=(60, 34, 10))
+
+    def _yoke_cheek(self, d, side: int) -> None:
+        """One shoulder bracket plate, standing on the turret in the arm plane."""
+        u, a = self._axes()
+        off = side * self.YOKE_HW
+        sh = (0.0, 0.0, self.SHOULDER_Z)
+        pts = self._disc(sh, 13, off)
+        for r in (-15, 15):
+            pts.append(self.P(u[0] * r + a[0] * off, u[1] * r + a[1] * off, self.PILLAR_H))
+        d.polygon(convex_hull(pts), fill=ARM_SHADE, outline=ARM_EDGE, width=SS)
 
     def _gripper(self, d, joints) -> None:
         P, th = self.P, self.pose.theta
@@ -389,16 +444,16 @@ class RobotArm:
     def draw(self, d: ImageDraw.ImageDraw) -> None:
         j = self.forward()
         S, E, Wr = (self.P(*j[k]) for k in ("shoulder", "elbow", "wrist"))
+        far_side = self._far_side()
         self._pillar(d)
-        # Draw the links that face away from the viewer (pointing back towards
-        # the conveyor) before the shoulder yoke, so depth ordering reads right.
-        self._shoulder_yoke(d, j)
+        self._yoke_cheek(d, far_side)            # cheek plate behind the arm
         self._thick(d, S, E, 17 * SS, ARM_WHITE, ARM_EDGE)
         self._thick(d, E, Wr, 13 * SS, ARM_WHITE, ARM_EDGE)
         self._gripper(d, j)
-        self._joint(d, S, 9)
-        self._joint(d, E, 8)
-        self._joint(d, Wr, 5)
+        self._yoke_cheek(d, -far_side)           # cheek plate in front of the arm
+        self._hinge(d, j["shoulder"], 9, self.YOKE_HW + 3)
+        self._hinge(d, j["elbow"], 8, 10)
+        self._hinge(d, j["wrist"], 5, 7)
 
 
 # --------------------------------------------------------------------------
